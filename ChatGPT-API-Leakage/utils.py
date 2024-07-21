@@ -60,7 +60,7 @@ def db_key_exists(cur: Cursor, apiKey) -> bool:
     return cur.fetchone() is not None
 
 
-def check_key(key, model="gpt-3.5-turbo-0125") -> int:
+def check_key(key, model="gpt-3.5-turbo") -> int:
     try:
         client = OpenAI(api_key=key)
 
