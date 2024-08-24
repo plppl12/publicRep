@@ -5,8 +5,10 @@ import pickle
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from sqlite3 import Connection, Cursor
 
+from configs import keywords, languages, regex_list
+
+# from functools import property
 from selenium import webdriver
 from selenium.common.exceptions import UnableToSetCookieException
 from selenium.webdriver.common.by import By
@@ -14,43 +16,48 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from tqdm import tqdm
 
-from utils import (
-    check_key,
-    db_close,
-    db_delete,
-    db_get_all_keys,
-    db_insert,
-    db_key_exists,
-    db_open,
-    db_remove_duplication,
-)
+from utils import check_key, db_close, db_delete, db_get_all_keys, db_insert, db_key_exists, db_open, db_remove_duplication
 
 FORMAT = "%(message)s"
 logging.basicConfig(level=logging.INFO, format=FORMAT, datefmt="[%X]")
 log = logging.getLogger("ChatGPT-API-Leakage")
 
 
-class APIKeyLeakageScanner:
-    def __init__(self, db_file: str, keywords: list, languages: list):
-        self.db_file = db_file
-        log.info(f"📂 Opening database file {self.db_file}")
-        self.con, self.cur = db_open(self.db_file)
 
-        self.keywords = keywords
-        self.languages = languages
-        self.candidate_urls = [
-            f"https://github.com/search?q={keyword}+AND+%28%2Fsk-%5Ba-zA-Z0-9%5D%7B48%7D%2F%29+language%3A{language}&type=code&ref=advsearch"
-            for language in self.languages
-            for keyword in self.keywords
-        ]
+class ProgressManager:
+    def __init__(self, progress_file=".progress.txt"):
+        self.progress_file = progress_file
 
-    def _save_cookies(self):
+    def save(self, from_iter: int, total: int):
+        with open(self.progress_file, "w") as file:
+            file.write(f"{from_iter}/{total}/{time.time()}")
+
+    def load(self, total: int) -> int:
+        if not os.path.exists(self.progress_file):
+            return 0
+
+        with open(self.progress_file, "r") as file:
+            last, totl, tmst = file.read().strip().split("/")
+            last, totl = int(last), int(totl)
+
+        if time.time() - float(tmst) < 3600 and totl == total:
+            action = input(f"🔍 Progress found, do you want to continue from the last progress ({last}/{totl})? [yes] | no: ").lower()
+            if action in {"yes", "y", ""}:
+                return last
+
+        return 0
+
+class Cookies:
+    def __init__(self, driver):
+        self.driver = driver
+
+    def save(self):
         cookies = self.driver.get_cookies()
         with open("cookies.pkl", "wb") as file:
             pickle.dump(cookies, file)
             log.info("🍪 Cookies saved")
 
-    def _load_cookies(self):
+    def load(self):
         try:
             with open("cookies.pkl", "rb") as file:
                 cookies = pickle.load(file)
@@ -59,37 +66,43 @@ class APIKeyLeakageScanner:
                         self.driver.add_cookie(cookie)
                     except UnableToSetCookieException as e:
                         log.debug(f"🟡 Warning, unable to set a cookie {cookie}")
-        except EOFError as e:
-            if os.path.exists("cookies.pkl"):
-                os.remove("cookies.pkl")
-            log.error(
-                "🔴 Error, unable to load cookies, invalid cookies has been removed, please restart."
-            )
-        except pickle.UnpicklingError as e:
-            if os.path.exists("cookies.pkl"):
-                os.remove("cookies.pkl")
-            log.error(
-                "🔴 Error, load cookies failed, invalid cookies has been removed, please restart."
-            )
+        except (EOFError, pickle.UnpicklingError):
+            os.remove("cookies.pkl") if os.path.exists("cookies.pkl") else None
+            log.error("🔴 Error, unable to load cookies, invalid cookies has been removed, please restart.")
 
-    def _test_cookies(self):
+    def test(self):
         """
         Test if the user is really logged in
         """
         log.info("🤗 Redirecting ...")
         self.driver.get("https://github.com/")
 
-        if self.driver.find_elements(
-            by=By.XPATH, value="//*[contains(text(), 'Sign in')]"
-        ):
-            return False
+        if self.driver.find_elements(by=By.XPATH, value="//*[contains(text(), 'Sign in')]"):
+            os.remove("cookies.pkl") if os.path.exists("cookies.pkl") else None
+            log.error("🔴 Error, you are not logged in, please restart and try again.")
+            exit(1)
         return True
 
-    def _hit_rate_limit(self):
-        return self.driver.find_elements(
-            by=By.XPATH,
-            value="//*[contains(text(), 'You have exceeded a secondary rate limit')]",
-        )
+
+class APIKeyLeakageScanner:
+    def __init__(self, db_file: str, keywords: list, languages: list):
+        self.db_file = db_file
+        self.progress = ProgressManager()
+
+        log.info(f"📂 Opening database file {self.db_file}")
+        self.con, self.cur = db_open(self.db_file)
+
+        self.keywords = keywords
+        self.languages = languages
+        self.candidate_urls = [
+            f"https://github.com/search?q={keyword}+AND+(/{regex.pattern}/)+language:{language}&type=code&ref=advsearch"
+            for regex in regex_list
+            for language in self.languages
+            for keyword in self.keywords
+            if regex.pattern != r"sk-proj-\S{74}T3BlbkFJ\S{73}A" and regex.pattern != r"sk-proj-\S{58}T3BlbkFJ\S{58}"
+        ]
+        self.candidate_urls.insert(0, f"https://github.com/search?q=(/{regex_list[0].pattern}/)&type=code&ref=advsearch")
+        self.candidate_urls.insert(0, f"https://github.com/search?q=(/{regex_list[1].pattern}/)&type=code&ref=advsearch")
 
     def login_to_github(self):
         log.info("🌍 Opening Chrome ...")
@@ -105,51 +118,53 @@ class APIKeyLeakageScanner:
         self.driver = webdriver.Chrome(options=self.options)
         self.driver.implicitly_wait(3)
 
+        self.cookies = Cookies(self.driver)
+
         cookie_exists = os.path.exists("cookies.pkl")
         self.driver.get("https://github.com/login")
 
         if not cookie_exists:
             log.info("🤗 No cookies found, please login to GitHub first")
             input("Press Enter after you logged in: ")
-            self._save_cookies()
+            self.cookies.save()
         else:
             log.info("🍪 Cookies found, loading cookies")
-            self._load_cookies()
+            self.cookies.load()
 
-        if not self._test_cookies():
-            if os.path.exists("cookies.pkl"):
-                os.remove("cookies.pkl")
-            log.error("🔴 Error, you are not logged in, please restart and try again.")
-            exit(1)
-
-        # TODO: check if the user is logged in, if cookies are expired, etc.
+        self.cookies.test()
 
     def _process_url(self, url: str):
         self.driver.get(url)
-        pattern = re.compile(r"sk-[a-zA-Z0-9]{48}")
 
+        expand_urls = []
         while True:
             # If current webpage is reached the rate limit, then wait for 30 seconds
-            if self._hit_rate_limit():
+            if self.driver.find_elements(by=By.XPATH, value="//*[contains(text(), 'You have exceeded a secondary rate limit')]"):
                 for _ in tqdm(range(30), desc="⏳ Rate limit reached, waiting ..."):
                     time.sleep(1)
                 self.driver.refresh()
                 continue
 
             # Expand all the code
-            [
-                element.click()
-                for element in self.driver.find_elements(
-                    by=By.XPATH, value="//*[contains(text(), 'more match')]"
-                )
-            ]
+            [element.click() for element in self.driver.find_elements(by=By.XPATH, value="//*[contains(text(), 'more match')]")]
 
-            codes = self.driver.find_elements(
-                by=By.CLASS_NAME, value="code-list"
-            )  # find all elements with class name 'f4'
+            codes = self.driver.find_elements(by=By.CLASS_NAME, value="code-list")  # find all elements with class name 'f4'
             for element in codes:
-                apis = pattern.findall(element.text)
-                if len(apis) == 0:
+                apis = []
+                # Check all regex for each code block
+                for regex in regex_list:
+                    if regex.pattern == r"sk-proj-\S{74}T3BlbkFJ\S{73}A":
+                        # Very Long Key
+                        prefix_test = re.compile(r"sk-proj-\S{74}T3BlbkFJ")
+                        if len(prefix_test.findall(element.text)) > 0:
+                            # Need to show full code. (because the api key is too long)
+                            # get the <a> tag
+                            a_tag = element.find_element(by=By.XPATH, value=".//a")
+                            expand_urls.append(a_tag.get_attribute("href"))
+                    else:
+                        apis.extend(regex.findall(element.text))
+
+                if len(apis) == 0 and len(expand_urls) == 0:
                     continue
 
                 apis = list(set(apis))
@@ -160,57 +175,47 @@ class APIKeyLeakageScanner:
                     for idx, result in enumerate(results):
                         db_insert(self.con, self.cur, apis[idx], result)
 
-            next_buttons = self.driver.find_elements(
-                by=By.XPATH, value="//a[@aria-label='Next Page']"
-            )
+            next_buttons = self.driver.find_elements(by=By.XPATH, value="//a[@aria-label='Next Page']")
 
             try:
-                WebDriverWait(self.driver, 5).until(
-                    EC.presence_of_element_located(
-                        (By.XPATH, "//a[@aria-label='Next Page']")
-                    )
-                )
+                WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((By.XPATH, "//a[@aria-label='Next Page']")))
 
-                next_buttons = self.driver.find_elements(
-                    by=By.XPATH, value="//a[@aria-label='Next Page']"
-                )
+                next_buttons = self.driver.find_elements(by=By.XPATH, value="//a[@aria-label='Next Page']")
                 next_buttons[0].click()
             except Exception as _:
                 # log.info("    ⚪️ No more pages")
                 break
 
-    def _save_progress(self, from_iter: int):
-        with open(".progress.txt", "w") as file:
-            # Save the progress and timestamp
-            file.write(f"{from_iter}/{len(self.candidate_urls)}/{time.time()}")
 
-    def _load_progress(self):
-        if not os.path.exists(".progress.txt"):
-            return 0
-        with open(".progress.txt", "r") as file:
-            progress = file.read().strip().split("/")
-            last = int(progress[0])
-            totl = int(progress[1])
-            tmst = float(progress[2])
-            # if the time is less than 1 hour, then continue from the last progress
-            if time.time() - tmst < 3600 and totl == len(self.candidate_urls):
-                # ask the user if they want to continue from the last progress
-                action = input(f"🔍 Progress found, do you want to continue from the last progress ({last}/{totl})? [yes] | no: ")
-                if action.lower() == "yes" or action.lower() == "y" or action == "":
-                    return int(progress[0])
-                else:
-                    return 0
-            return 0
+        # Handle the expand_urls
+        for expand_url in expand_urls:
+            self.driver.get(expand_url)
 
-    def search(self, from_iter: int = None):
+            try:
+                WebDriverWait(self.driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "iframe")))
+            except Exception as _:
+                log.error("🔴 Error, unable to find the iframe, continue anyway")
+            time.sleep(3)
+            regex = re.compile(r"sk-proj-\S{74}T3BlbkFJ\S{73}A")
+            # apply the regex to the whole page
+            apis = regex.findall(self.driver.page_source)
+            apis = [api for api in apis if not db_key_exists(self.cur, api)]
+            print(apis)
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                results = list(executor.map(check_key, apis))
+                for idx, result in enumerate(results):
+                    db_insert(self.con, self.cur, apis[idx], result)
+
+    def search(self, from_iter: int | None = None):
+        total = len(self.candidate_urls)
         pbar = tqdm(
             enumerate(self.candidate_urls),
-            total=len(self.candidate_urls),
+            total=total,
             desc="🔍 Searching ...",
         )
 
         if from_iter is None:
-            from_iter = self._load_progress()
+            from_iter = self.progress.load(total=total)
 
         for idx, url in enumerate(self.candidate_urls):
             if idx < from_iter:
@@ -219,7 +224,7 @@ class APIKeyLeakageScanner:
                 log.debug(f"⚪️ Skip {url}")
                 continue
             self._process_url(url)
-            self._save_progress(idx)
+            self.progress.save(idx, total)
             log.debug(f"\n🔍 Finished {url}")
             pbar.update()
         pbar.close()
@@ -246,79 +251,6 @@ class APIKeyLeakageScanner:
 
 
 def main(from_iter: int = None, check_existed_keys_only: bool = False):
-    keywords = [
-        "AI ethics",
-        "AI in customer service",
-        "AI in education",
-        "AI in finance",
-        "AI in healthcare",
-        "AI in marketing",
-        "AI-driven automation",
-        "AI-powered content creation",
-        "CoT",
-        "DPO",
-        "RLHF",
-        "agent",
-        "ai model",
-        "aios",
-        "api key",
-        "apikey",
-        "artificial intelligence",
-        "chain of thought",
-        "chatbot",
-        "chatgpt",
-        "competitor analysis",
-        "content strategy",
-        "conversational AI",
-        "data analysis",
-        "deep learning",
-        "direct preference optimization",
-        "experiment",
-        "gpt",
-        "gpt-3",
-        "gpt-4",
-        "gpt4",
-        "key",
-        "keyword clustering",
-        "keyword research",
-        "lab",
-        "language model experimentation",
-        "large language model",
-        "llama.cpp",
-        "llm",
-        "long-tail keywords",
-        "machine learning",
-        "multi-agent",
-        "multi-agent systems",
-        "natural language processing",
-        "openai",
-        "personalized AI",
-        "project",
-        "rag",
-        "reinforcement learning from human feedback",
-        "retrieval-augmented generation",
-        "search intent",
-        "semantic search",
-        "thoughts",
-        "virtual assistant",
-        "实验",
-        "密钥",
-        "测试",
-        "语言模型",
-    ]
-
-    languages = [
-        '"Jupyter Notebook"',
-        "Python",
-        "Shell",
-        "JavaScript",
-        "TypeScript",
-        "Java",
-        "Go",
-        "C%2B%2B",
-        "PHP",
-    ]
-
     leakage = APIKeyLeakageScanner("github.db", keywords, languages)
     if not check_existed_keys_only:
         leakage.login_to_github()
